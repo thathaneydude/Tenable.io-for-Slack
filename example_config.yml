@@ -1,0 +1,10 @@
+api_access_key: 123
+api_secret_key: 456
+audit_logs:
+  slack_webhook_url: https://hooks.slack.com/services/123
+  enabled_event_types:
+    - user.impersonation.start
+    - user.impersonation.end
+    - user.create
+    - user.delete
+    - user.update

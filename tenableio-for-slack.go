@@ -2,19 +2,21 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	log "github.com/sirupsen/logrus"
+	"github.com/thathaneydude/go-tenable"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
-	"log"
-	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 )
 
 const baseTenablePath = "https://cloud.tenable.com"
+const cacheFileName = "cache.log"
+const logFileName = "TenableIOForSlack.log"
 
 func main() {
 	// Command line arguments for YAML config
@@ -22,24 +24,27 @@ func main() {
 	flag.StringVar(&configPath, "config", "config.yml", "Full Path to the YAML configuration file")
 	flag.Parse()
 
-	// Read in file
+	// Check to see if configuration file in the command line exists
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		fmt.Printf("Configuration file does not exists: %v\n", err)
+		log.Error("Configuration file does not exists: %v\n", err)
 		os.Exit(0)
 	}
 
 	// Read in YAML config
 	yamlData, err := ioutil.ReadFile(configPath)
 	if err != nil {
-		fmt.Printf("Unable to read YAML configuration file: %v\n", err)
+		log.Error("Unable to read YAML configuration file: %v\n", err)
 		os.Exit(0)
 	}
 	var config Config
 
 	yamlErr := yaml.Unmarshal(yamlData, &config)
 	if yamlErr != nil {
-		fmt.Printf("Unable to unmarshal YAML config: %v\n", yamlErr)
+		log.Error("Unable to unmarshal YAML config: %v\n", yamlErr)
 	}
+
+	ConfigureLogging(config.LogPath, logFileName)
+
 	// Create Tenable.io Client with configured keys
 	TenableClient := NewTenableIOClient(config.APIAccessKey, config.APISecretKey)
 
@@ -52,7 +57,7 @@ func main() {
 	req := TenableClient.NewRequest("GET", "audit-log/v1/events", nil)
 	GetParams := req.URL.Query()
 	GetParams.Add("f", fmt.Sprintf("date.gt:%v", dateFilter))
-	fmt.Printf("Requesting Logs with filter: %v\n", dateFilter)
+	//log.Printf("Requesting Logs with filter: %v\n", dateFilter)
 	req.URL.RawQuery = GetParams.Encode()
 
 	// Request Logs
@@ -63,34 +68,63 @@ func main() {
 	// Unmarshal API response to AuditLogResponse struct
 	responseError := json.Unmarshal(ResponseBytes, &Logs)
 	if responseError != nil {
-		fmt.Printf("Unable to unmarshal Audit Log Response: %v\n", responseError)
+		log.Error("Unable to unmarshal Audit Log Response: %v\n", responseError)
 		os.Exit(0)
 	}
 
 	// Compare Responses with local file of today's events
-	const cacheFileName = "cache.log"
-
-	if _, err := os.Stat(cacheFileName); os.IsNotExist(err) {
-		file, _ := os.Create(cacheFileName)
-
+	var cachedEvents []string
+	if fileStat, err := os.Stat(cacheFileName); os.IsNotExist(err) || time.Now().Sub(fileStat.ModTime()) > 24*time.Hour {
+		log.Debug("Cache is being rebuilt for today")
 	} else {
-		file, _ := os.Open(cacheFileName)
-		cachedEvents, _ := readLines(cacheFileName)
+		cachedEvents, err = readLines(cacheFileName)
+		if err != nil {
+			log.Error("Unable to read cached audit messages. Exiting...")
+			os.Exit(0)
+		}
 	}
 
 	// Create a Slack Client for sending messages
 	slackClient := NewSlackClient(config.AuditLogConfig.SlackWebHook)
 
 	// Iterate over the log response and create slack message for each log type that's configured
-	fmt.Printf("%v Events returned\n", len(Logs.Events))
+	var linesToWrite []string
+	//linesToWrite = append(linesToWrite, cachedEvents...)
+	log.Info("%v Events returned\n", len(Logs.Events))
 	for _, event := range Logs.Events {
 		// Check to see if the log event action matches one of the types in the config
-		if stringInSlice(event.Action, config.AuditLogConfig.EnabledEventTypes) {
-			// Send Slack Message
-			slackClient.SendMessage(&SlackMessage{text: BuildSlackText(event)})
-			os.Exit(0)
+		if !stringInSlice(event.Action, config.AuditLogConfig.EnabledEventTypes) {
+			log.Debug("Event \"%v\" is not configured\n", event.Action)
+			continue
 		}
+
+		// Check to see if the event has already been sent
+		if stringInSlice(event.ID, cachedEvents) {
+			log.Debug("Event \"%v\" has already been sent to Slack\n", event.ID)
+			continue
+		}
+
+		// Send Slack Message
+		log.Debug("Event to Send: %v\n", event)
+		slackMessage := SlackMessage{text: BuildSlackText(event)}
+		log.Debug("Corresponding Slack Message: %v\n", slackMessage)
+		slackClient.SendMessage(&slackMessage)
+		linesToWrite = append(linesToWrite, event.ID)
 	}
+	writeError := writeLines(linesToWrite, cacheFileName)
+	if writeError != nil {
+		log.Error("Writing %v events to today's cache\n", len(linesToWrite))
+	}
+}
+
+func ConfigureLogging(LogPath string, FileName string) {
+	f, err := os.OpenFile(filepath.Join(LogPath, FileName), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	//set output of logs to f
+	log.SetOutput(f)
 }
 
 func readLines(path string) ([]string, error) {
@@ -108,9 +142,9 @@ func readLines(path string) ([]string, error) {
 	return lines, scanner.Err()
 }
 
-// writeLines writes the lines to the given file.
 func writeLines(lines []string, path string) error {
-	file, err := os.Create(path)
+	// writeLines writes the lines to the given file.
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -121,69 +155,6 @@ func writeLines(lines []string, path string) error {
 		fmt.Fprintln(w, line)
 	}
 	return w.Flush()
-}
-
-func BuildSlackText(event Event) string {
-	var ResponseText string
-	switch event.Action {
-	case "user.impersonation.start":
-		ResponseText = fmt.Sprintf("User \"%v\" has started impersonating user \"%v\"", event.Actor.Name, event.Target.Name)
-	case "user.impersonation.end":
-		ResponseText = fmt.Sprintf("User \"%v\" has finished impersonating user \"%v\"", event.Actor.Name, event.Target.Name)
-	case "user.create":
-		if event.Target.Name != "" {
-			ResponseText = fmt.Sprintf("User \"%v\" has created user \"%v\"", event.Actor.Name, event.Target.Name)
-		} else {
-			ResponseText = fmt.Sprintf("User \"%v\" has created a user", event.Actor.Name)
-		}
-
-	case "user.delete":
-		ResponseText = fmt.Sprintf("User \"%v\" has deleted user \"%v\"", event.Actor.Name, event.Target.Name)
-	case "user.update":
-		if event.Actor.Name == event.Target.Name {
-			ResponseText = fmt.Sprintf("User \"%v\" has updated their account", event.Actor.Name)
-		} else {
-			ResponseText = fmt.Sprintf("User \"%v\" has updated user \"%v\"", event.Actor.Name, event.Target.Name)
-		}
-	}
-	return ResponseText
-}
-
-type SlackClient struct {
-	client     *http.Client
-	WebHookURL string
-}
-
-type SlackMessage struct {
-	text string
-}
-
-func (slack *SlackClient) SendMessage(msg *SlackMessage) http.Response {
-	bodyMap := map[string]interface{}{
-		"text": msg.text,
-	}
-	body, _ := json.Marshal(bodyMap)
-	req, err := http.NewRequest("POST", slack.WebHookURL, bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	if err != nil {
-		fmt.Printf("Unable to build Slack request: %v\n", err)
-	}
-	resp, err := slack.client.Do(req)
-	if err != nil {
-		fmt.Printf("Unable to send Slack request: %v\n", err)
-	}
-	return *resp
-
-}
-
-func NewSlackClient(WebHookURL string) SlackClient {
-	client := &http.Client{}
-	slackClient := &SlackClient{
-		client,
-		WebHookURL,
-	}
-
-	return *slackClient
 }
 
 func stringInSlice(a string, list []string) bool {
@@ -198,76 +169,9 @@ func stringInSlice(a string, list []string) bool {
 type Config struct {
 	APIAccessKey   string `yaml:"api_access_key"`
 	APISecretKey   string `yaml:"api_secret_key"`
+	LogPath        string `yaml:"log_path"`
 	AuditLogConfig struct {
 		SlackWebHook      string   `yaml:"slack_webhook_url"`
 		EnabledEventTypes []string `yaml:"enabled_event_types"`
 	} `yaml:"audit_logs"`
-}
-
-type Event struct {
-	ID          string      `json:"id"`
-	Action      string      `json:"action"`
-	Crud        string      `json:"crud"`
-	IsFailure   bool        `json:"is_failure"`
-	Received    time.Time   `json:"received"`
-	Description interface{} `json:"description"`
-	Actor       struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	} `json:"actor"`
-	IsAnonymous interface{} `json:"is_anonymous"`
-	Target      struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-		Type string `json:"type"`
-	} `json:"target"`
-	Fields []interface{} `json:"fields"`
-}
-
-type AuditLogResponse struct {
-	Events     []Event `json:"events"`
-	Pagination struct {
-		Total int `json:"total"`
-		Limit int `json:"limit"`
-	} `json:"pagination"`
-}
-
-type TenableIOClient struct {
-	client    *http.Client
-	basePath  string
-	accessKey string
-	secretKey string
-}
-
-func NewTenableIOClient(accessKey string, secretKey string) TenableIOClient {
-	client := &http.Client{}
-	tio := &TenableIOClient{
-		client,
-		baseTenablePath,
-		accessKey,
-		secretKey,
-	}
-	return *tio
-}
-
-func (tio *TenableIOClient) Do(req *http.Request) http.Response {
-	req.Header.Set("X-ApiKeys", fmt.Sprintf("accessKey=%v; secretKey=%v;", tio.accessKey, tio.secretKey))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "GoTenable")
-	fmt.Printf("Requesting \"%v\": %v\n", req.URL, req.Body)
-	resp, err := tio.client.Do(req)
-	if err != nil {
-		fmt.Printf("Unable to run request: %v\n", err)
-	}
-
-	return *resp
-}
-
-func (tio *TenableIOClient) NewRequest(method string, endpoint string, body []byte) *http.Request {
-	fullUrl := fmt.Sprintf("%v/%v", baseTenablePath, endpoint)
-	req, err := http.NewRequest(method, fullUrl, bytes.NewBuffer(body))
-	if err != nil {
-		log.Printf("Unable to build request [%v] %v request\n", method, endpoint)
-	}
-	return req
 }

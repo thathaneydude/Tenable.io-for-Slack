@@ -1,5 +1,6 @@
 api_access_key: 123
 api_secret_key: 456
+log_path: /path/to/log/dir
 audit_logs:
   slack_webhook_url: https://hooks.slack.com/services/123
   enabled_event_types:

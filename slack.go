@@ -4,34 +4,35 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
+	log "github.com/sirupsen/logrus"
+	"github.com/thathaneydude/go-tenable"
 	"net/http"
 )
 
-func BuildSlackText(event Event) string {
+func BuildSlackText(event go_tenable.Event) string {
 	var ResponseText string
 	switch event.Action {
 	case "user.impersonation.start":
-		ResponseText = fmt.Sprintf("User \"%v\" has started impersonating user \"%v\"", event.Actor.Name, event.Target.Name)
+		ResponseText = fmt.Sprintf("\"%v\" has started impersonating user \"%v\"", event.Actor.Name, event.Target.Name)
 	case "user.impersonation.end":
-		ResponseText = fmt.Sprintf("User \"%v\" has finished impersonating user \"%v\"", event.Actor.Name, event.Target.Name)
+		ResponseText = fmt.Sprintf("\"%v\" has finished impersonating user \"%v\"", event.Actor.Name, event.Target.Name)
 	case "user.create":
 		if event.Target.Name != "" {
-			ResponseText = fmt.Sprintf("User \"%v\" has created user \"%v\"", event.Actor.Name, event.Target.Name)
+			ResponseText = fmt.Sprintf("\"%v\" has created user \"%v\"", event.Actor.Name, event.Target.Name)
 		} else {
-			ResponseText = fmt.Sprintf("User \"%v\" has created a user", event.Actor.Name)
+			ResponseText = fmt.Sprintf("\"%v\" has created a user", event.Actor.Name)
 		}
 
 	case "user.delete":
-		ResponseText = fmt.Sprintf("User \"%v\" has deleted user \"%v\"", event.Actor.Name, event.Target.Name)
+		ResponseText = fmt.Sprintf("\"%v\" has deleted user \"%v\"", event.Actor.Name, event.Target.Name)
 	case "user.update":
 		if event.Actor.Name == event.Target.Name {
-			ResponseText = fmt.Sprintf("User \"%v\" has updated their account", event.Actor.Name)
+			ResponseText = fmt.Sprintf("\"%v\" has updated their account", event.Actor.Name)
 		} else {
-			ResponseText = fmt.Sprintf("User \"%v\" has updated user \"%v\"", event.Actor.Name, event.Target.Name)
+			ResponseText = fmt.Sprintf("\"%v\" has updated user \"%v\"", event.Actor.Name, event.Target.Name)
 		}
 	}
-	log.Printf("Message being sent to Slack: %v\n", ResponseText)
+	log.Debug(fmt.Sprintf("Message being sent to Slack: %v\n", ResponseText))
 	return ResponseText
 }
 
@@ -45,7 +46,7 @@ type SlackMessage struct {
 }
 
 func (slack *SlackClient) SendMessage(msg *SlackMessage) http.Response {
-	log.Printf("Sending message to Slack WebHook: %v\n", msg.text)
+	log.Debug(fmt.Sprintf("Sending message to Slack WebHook: %v\n", msg.text))
 	bodyMap := map[string]interface{}{
 		"text": msg.text,
 	}
@@ -53,11 +54,11 @@ func (slack *SlackClient) SendMessage(msg *SlackMessage) http.Response {
 	req, err := http.NewRequest("POST", slack.WebHookURL, bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
 	if err != nil {
-		log.Printf("Unable to build Slack request: %v\n", err)
+		log.Error(fmt.Sprintf("Unable to build Slack request: %v\n", err))
 	}
 	resp, err := slack.client.Do(req)
 	if err != nil {
-		log.Printf("Unable to send Slack request: %v\n", err)
+		log.Error(fmt.Sprintf("Unable to send Slack request: %v\n", err))
 	}
 	return *resp
 
